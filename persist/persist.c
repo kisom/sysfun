@@ -135,7 +135,7 @@ static void
 spam(void)
 {
 	while (1) {
-		syslog(LOG_CRIT, "hey! you!");
+		syslog(LOG_EMERG, "hey! you!");
 		sleep(60);
 	}
 }
