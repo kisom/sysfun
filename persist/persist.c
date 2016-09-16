@@ -1,14 +1,10 @@
 /*
  * persist should do a few things:
- * 1. a fork should watch the binary. if it's removed, restore it.
+ * 1. a fork should watch the binary. if it's removed, restore it and if
+ *    the parent is killed, restart it.
  * 2. occasionally send messages to syslog
  * 3. the fork should rename itself.
  */
-
-/*
- * TODO: restart process
- */
-
 
 /* Feature macros. */
 #define _GNU_SOURCE
@@ -50,10 +46,8 @@ init(void)
 	free(p);
 
 	if (-1 == exelen) {
-		err(EXIT_FAILURE, "couldn't look up original file");
+		err(EXIT_FAILURE, "couldn't look up original file (%u, %s)", pid, p);
 	}
-
-	fprintf(stderr, "original exe is %s\n", exe);
 }
 
 
@@ -73,8 +67,7 @@ check_bin(void)
 		goto fin;
 	}
 
-	fprintf(stderr, "restoration required\n");
-	asprintf(&p, "/proc/%u/exe", pid);
+	asprintf(&p, "/proc/%u/exe", getpid());
 
 	/*
 	 * Now, figure out how big the exe actually is.
@@ -85,16 +78,13 @@ check_bin(void)
 	}
 
 	origlen = st.st_size;
-	fprintf(stderr, "original is %lu bytes\n", origlen);
 
 	if (-1 == (dst = open(exe, O_CREAT|O_WRONLY, 0755))) {
-		fprintf(stderr, "failed to create %s\n", exe);
 		failed = 1;
 		goto fin;
 	}
 
 	if (-1 == (src = open(p, O_RDONLY))) {
-		fprintf(stderr, "failed to open %s\n", p);
 		failed = 1;
 		goto fin;
 	}
@@ -104,7 +94,6 @@ check_bin(void)
 		goto fin;
 	}
 
-	fprintf(stderr, "restored %s\n", exe);
 fin:
 	free(p);
 	if (dst > 0) {
@@ -122,11 +111,49 @@ fin:
 
 
 static void
+check_run(void)
+{
+	struct stat	 st;
+	char		*nargv[2] = {BIN_NAME, NULL};
+	char		*p = NULL;
+
+	asprintf(&p, "/proc/%u", pid);
+	if (0 == stat(p, &st)) {
+		/* Process is still running, so there's nothing to do. */
+		free(p);
+		return;
+	}
+
+	/* Process isn't running, so restart it. */
+	free(p);
+	execv(exe, nargv);
+}
+
+
+static void
+reset_comm(void)
+{
+	FILE	*comm = NULL;
+	char	*p = NULL;
+
+	asprintf(&p, "/proc/%u/comm", pid);
+	if (NULL != (comm = fopen(p, "w"))) {
+		fwrite(WATCHER_NAME, strlen(WATCHER_NAME), 1, comm);
+		fclose(comm);
+	} else {
+		warn("failed to rewrite commandline");
+	}
+
+	free(p);
+}
+
+static void
 watch(void)
 {
 	while (1) {
 		sleep(60);
 		check_bin();
+		check_run();
 	}
 }
 
@@ -135,7 +162,7 @@ static void
 spam(void)
 {
 	while (1) {
-		syslog(LOG_EMERG, "hey! you!");
+		syslog(LOG_INFO, "hey! you!");
 		sleep(60);
 	}
 }
@@ -148,6 +175,7 @@ main(int argc, char *argv[])
 
 	if (0 == strcmp(argv[0], WATCHER_NAME)) {
 		pid = getppid();
+		reset_comm();
 	} else {
 		daemon(1, 1);
 		pid = getpid();
@@ -155,16 +183,12 @@ main(int argc, char *argv[])
 
 	init();
 
-
-	fprintf(stderr, "running as %s\n", argv[0]);
-
 	/*
 	 * Make sure to spam every console using LOG_EMERG.
 	 */
 	openlog("persist", LOG_CONS|LOG_NDELAY, LOG_DAEMON);
 
 	if (pid == getpid()) {
-		fprintf(stderr, "in the parent\n");
 		switch (fork()) {
 		case -1:
 			/* Generate a core dump. */
