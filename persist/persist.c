@@ -1,4 +1,6 @@
 /*
+ * Linux-specific persistent program.
+ *
  * persist should do a few things:
  * 1. a fork should watch the binary. if it's removed, restore it and if
  *    the parent is killed, restart it.
@@ -22,8 +24,13 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * BIN_NAME is the name this is built under, and WATCHER_NAME is the name
+ * the watcher process will take up.
+ */
 #define BIN_NAME	"persist"
 #define WATCHER_NAME	"bash"
+
 #ifndef MAX_PATH
 #define MAX_PATH	4096
 #endif
@@ -31,10 +38,26 @@
 
 static pid_t	 pid = 0;
 static char	*name = NULL;
-static char	 exe[MAX_PATH];
+static char	 exe[PATH_MAX];
 static ssize_t	 exelen = 0;
 
 
+/*
+ * init prepopulates the original exe pathname.
+ *
+ * before we start forking around (keeping in mind the child process
+ * will attempt to rename itself), we need to know where the original
+ * program is. this probably should be done before the file is deleted,
+ * otherwise the " (deleted)" part of the name needs to be removed,
+ * which is doable but extra work.
+ *
+ * this exe name is kept around so we know where to write the restored
+ * file to in the event the original is deleted. this works by using
+ * the Linux procfs system: /proc/$$/exe is a special link; it can be
+ * read like a normal file (even if the target is deleted), and if
+ * readlink(2) is called on it, it returns the original path to the
+ * program (with " (deleted)" appended if the original was unlinked).
+ */
 static void
 init(void)
 {
@@ -51,6 +74,11 @@ init(void)
 }
 
 
+/*
+ * check_bin makes sure the original exe (as named by the exe value) is
+ * present. if not, the current program (/proc/getpid()/exe) is copied
+ * to the path named by exe using the sendfile(2) syscall.
+ */
 static void
 check_bin(void)
 {
@@ -79,6 +107,10 @@ check_bin(void)
 
 	origlen = st.st_size;
 
+	/*
+	 * Open file descriptors for the source and destination files;
+         * these are used by sendfile(2).
+	 */
 	if (-1 == (dst = open(exe, O_CREAT|O_WRONLY, 0755))) {
 		failed = 1;
 		goto fin;
@@ -96,6 +128,7 @@ check_bin(void)
 
 fin:
 	free(p);
+
 	if (dst > 0) {
 		close(dst);
 	}
@@ -110,6 +143,16 @@ fin:
 }
 
 
+/*
+ * check_run checks to see whether the parent process is running. before
+ * forking, the pid (or ppid) is stored in a static var. by stat(2)'ing
+ * /proc/pid, we can tell if the parent is running or not.
+ *
+ * if it's not running, we execv into a new parent process.
+ *
+ * N.B. this will fail if the path named by exe isn't present, so this
+ * should be called right after check_bin for maximum success.
+ */
 static void
 check_run(void)
 {
